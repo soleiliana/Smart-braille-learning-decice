@@ -1,0 +1,356 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "mbedtls/base64.h"
+#include <vector>
+#include <algorithm>
+#include <WiFiClientSecure.h>
+
+
+
+
+// ==========================================
+// --- HARDWARE ORIENTATION SETTINGS ---
+// ==========================================
+// Set to 'false' if lines of Braille run left-to-right on your screen.
+// Set to 'true' if the camera is mounted sideways (Braille runs top-to-bottom).
+const bool CAMERA_IS_SIDEWAYS = false;
+
+
+
+
+// --- YOUR HOME WiFi Credentials ---
+const char* ssid = "Nozaki-kun 2.4G";
+const char* password = "Phoebe  Hunter  Kim";
+
+
+
+
+// --- REPLACE THIS WITH YOUR PIPEDREAM WEBHOOK URL ---
+const char* pipedream_url = "https://eob3oy0rxnt5sgk.m.pipedream.net";
+
+
+
+
+// --- AI-Thinker ESP32-CAM Pin Definition ---
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+
+
+
+httpd_handle_t stream_httpd = NULL;
+
+
+
+
+// Struct to hold ML predictions for 2D Sorting
+struct BrailleLetter {
+  float x;
+  float y;
+  String class_label;
+};
+
+
+
+
+// --- BASE64 ENCODER (Uses PSRAM to prevent memory crashes) ---
+String base64Encode(uint8_t *buffer, size_t length) {
+  size_t outputLength;
+  mbedtls_base64_encode(NULL, 0, &outputLength, buffer, length);
+  unsigned char *base64_buf = (unsigned char *)ps_malloc(outputLength + 1);
+  if (!base64_buf) return "";
+  mbedtls_base64_encode(base64_buf, outputLength, &outputLength, buffer, length);
+  base64_buf[outputLength] = '\0';
+  String result = String((char *)base64_buf);
+  free(base64_buf);
+  return result;
+}
+
+
+
+
+// --- 1. ML API SCAN HANDLER (/scan_now) ---
+static esp_err_t scan_handler(httpd_req_t *req) {
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+
+
+
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+
+
+
+  String base64Image = base64Encode(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+
+
+
+
+  if (base64Image == "") {
+    httpd_resp_sendstr(req, "MEMORY ERROR");
+    return ESP_OK;
+  }
+
+
+
+
+  WiFiClientSecure client;
+  client.setInsecure();
+ 
+  HTTPClient http;
+  http.begin(client, pipedream_url);
+  http.addHeader("Content-Type", "application/json");
+
+
+
+
+  // Give Pipedream 20 seconds to run the ML model
+  http.setTimeout(20000);
+ 
+  String payload = "{\"bodyRaw64\":\"" + base64Image + "\"}";
+  int httpResponseCode = http.POST(payload);
+  String finalWord = "API ERROR";
+
+
+
+
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+   
+    DynamicJsonDocument doc(8192);
+    DeserializationError error = deserializeJson(doc, response);
+   
+    if (!error) {
+      JsonArray predictions = doc["predictions"];
+      std::vector<BrailleLetter> letters;
+
+
+
+
+      for (JsonObject pred : predictions) {
+        BrailleLetter bl;
+        bl.x = pred["x"].as<float>();
+        bl.y = pred["y"].as<float>();
+        bl.class_label = pred["class"].as<String>();
+        letters.push_back(bl);
+      }
+
+
+
+
+      // --- DYNAMIC 2D SORTING BASED ON CAMERA ORIENTATION ---
+      std::sort(letters.begin(), letters.end(), [](const BrailleLetter& a, const BrailleLetter& b) {
+        if (CAMERA_IS_SIDEWAYS) {
+          // Camera is sideways: Line breaks are on the X axis, letters flow top-to-bottom
+          if (abs(a.x - b.x) > 30.0) return a.x < b.x;
+          return a.y < b.y;
+        } else {
+          // Standard view: Line breaks are on the Y axis, letters flow left-to-right
+          if (abs(a.y - b.y) > 30.0) return a.y < b.y;
+          return a.x < b.x;
+        }
+      });
+
+
+
+
+      finalWord = "";
+      for (auto bl : letters) {
+        finalWord += bl.class_label;
+      }
+     
+      if(finalWord == "") finalWord = "NO BRAILLE DETECTED";
+    } else {
+      finalWord = "JSON PARSE ERROR";
+    }
+  } else {
+    Serial.print("HTTP POST Failed, Error Code: ");
+    Serial.println(httpResponseCode);
+  }
+ 
+  http.end();
+  httpd_resp_sendstr(req, finalWord.c_str());
+  return ESP_OK;
+}
+
+
+
+
+// --- 2. MJPEG STREAM HANDLER (/capture) ---
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+
+
+
+static esp_err_t capture_handler(httpd_req_t *req) {
+  camera_fb_t * fb = NULL;
+  esp_err_t res = ESP_OK;
+  char * part_buf[64];
+
+
+
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) { return res; }
+
+
+
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) { res = ESP_FAIL; break; }
+
+
+
+
+    res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    if (res == ESP_OK) {
+      size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, fb->len);
+      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+    }
+    esp_camera_fb_return(fb);
+    if (res != ESP_OK) break;
+  }
+  return res;
+}
+
+
+
+
+// --- Start Camera Web Server ---
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 81;
+  config.stack_size = 16384;
+
+
+
+
+  httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL };
+  httpd_uri_t scan_uri = { .uri = "/scan_now", .method = HTTP_GET, .handler = scan_handler, .user_ctx = NULL };
+
+
+
+
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &capture_uri);
+    httpd_register_uri_handler(stream_httpd, &scan_uri);
+    Serial.println("Camera Stream & API Server Started on Port 81");
+  }
+}
+
+
+
+
+void setup() {
+  Serial.begin(115200);
+
+
+
+
+  // --- FORCE STATIC IP ---
+  IPAddress local_IP(192, 168, 100, 200);  
+  IPAddress gateway(192, 168, 100, 1);    
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress primaryDNS(8, 8, 8, 8);
+  IPAddress secondaryDNS(8, 8, 4, 4);
+ 
+  WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
+
+
+
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Nozaki-kun 2.4G");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi connected");
+
+
+
+
+  // --- Initialize Camera ---
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM; config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM; config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM; config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM; config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000; config.pixel_format = PIXFORMAT_JPEG;
+
+
+
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 1;
+  } else {
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 1;
+  }
+
+
+
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+
+
+
+
+  // --- OPTIONAL: FLIP CAMERA UPSIDE DOWN ---
+  // If your image is completely upside down in the web view, uncomment these two lines:
+  // sensor_t * s = esp_camera_sensor_get();
+  // s->set_vflip(s, 1);
+  // s->set_hmirror(s, 1);
+
+
+
+
+  startCameraServer();
+}
+
+
+
+
+void loop() {
+  delay(10000);
+}
+
+
