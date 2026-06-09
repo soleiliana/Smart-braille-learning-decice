@@ -1,0 +1,859 @@
+
+
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+
+// --- PCA9685 SERVO DRIVER ---
+Adafruit_PWMServoDriver pwm;
+const int dots[6] = {0, 1, 2, 3, 4, 5};
+const int DOWN_POS = 250;
+const int UP_POS   = 360;
+int currentPos[6]  = {DOWN_POS, DOWN_POS, DOWN_POS, DOWN_POS, DOWN_POS, DOWN_POS};
+
+
+// --- BRAILLE ALPHABET LOOKUP TABLE ---
+const uint8_t braille[26][6] = {
+  {1,0,0,0,0,0},{1,1,0,0,0,0},{1,0,0,1,0,0},{1,0,0,1,1,0},{1,0,0,0,1,0},
+  {1,1,0,1,0,0},{1,1,0,1,1,0},{1,1,0,0,1,0},{0,1,0,1,0,0},{0,1,0,1,1,0},
+  {1,0,1,0,0,0},{1,1,1,0,0,0},{1,0,1,1,0,0},{1,0,1,1,1,0},{1,0,1,0,1,0},
+  {1,1,1,1,0,0},{1,1,1,1,1,0},{1,1,1,0,1,0},{0,1,1,1,0,0},{0,1,1,1,1,0},
+  {1,0,1,0,0,1},{1,1,1,0,0,1},{0,1,0,1,1,1},{1,0,1,1,0,1},{1,0,1,1,1,1},
+  {1,0,1,0,1,1}
+};
+
+
+// --- SAFE HARDWARE PINS FOR ESP32-S3 ---
+const int buttonLearnPin = 4;
+const int buttonGamePin = 5;
+const int buttonScanPin = 6;
+const int buttonDownloadPin = 7;
+
+
+// --- SCANNER LED PINS ---
+const int scanLed1 = 11;
+const int scanLed2 = 10;
+
+
+// --- BUTTON TRACKING (Prevents freezing) ---
+bool lastLearnState = HIGH;
+bool lastGameState = HIGH;
+bool lastScanState = HIGH;
+bool lastDownloadState = HIGH;
+
+
+// --- SYSTEM STATE ---
+int activeMode = 0; // 0=Menu, 1=Learn, 2=Game, 3=Scan
+
+
+// --- MODE 1: LEARN DATA ---
+int alphabetIndex = 0;
+int learnStateStep = 0;
+unsigned long lastLetterTime = 0;
+
+
+// --- MODE 2: GAME DATA ---
+String testWords[30] = {
+  "APPLE", "CHAIR", "TABLE", "BRAILLE", "SMART", "WATER", "LIGHT", "BREAD", "SPOON", "SHIRT",
+  "HOUSE", "PLANT", "PHONE", "GLASS", "CLOCK", "TRAIN", "STONE", "BRUSH", "CABLE", "MOUSE",
+  "KEYBOARD", "SCREEN", "WINDOW", "BOTTLE", "PENCIL", "PAPER", "MARKER", "BOOK", "BAG", "SHOES"
+};
+
+
+// --- DECK SHUFFLING DATA ---
+int shuffledIndices[30]; // Holds the shuffled order of the words
+int targetWordIndex = -1;
+int wordsServed = 0;
+const int totalRounds = 15;
+unsigned long gameStartTime = 0;
+bool gameStarting = false;      
+unsigned long gameInitTime = 0;  
+
+
+// --- STORE YOUR ENTIRE HTML HERE ---
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Smart Braille Learning Device</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;600;800&display=swap');
+
+
+        :root {
+            --bg-dark: #0f172a;        
+            --panel-bg: #f8fafc;    
+            --text-main: #1e293b;      
+            --accent-blue: #3b82f6;    
+            --accent-purple: #8b5cf6;  
+            --accent-teal: #06b6d4;    
+            --glass-card: rgba(255, 255, 255, 0.03);
+            --border-ui: #e2e8f0;
+            --radius-xl: 60px;
+        }
+
+
+        html, body {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            overflow: hidden;
+            background-color: var(--bg-dark);
+            background-image: radial-gradient(circle at 0% 0%, rgba(59, 130, 246, 0.1) 0%, transparent 40%),
+                              radial-gradient(circle at 100% 100%, rgba(139, 92, 246, 0.1) 0%, transparent 40%);
+            display: flex; justify-content: center; align-items: center;
+            font-family: 'Plus Jakarta Sans', sans-serif;
+        }
+
+
+        #app-canvas {
+            width: 1800px; height: 1400px;
+            position: relative;
+            transform: scale(0.67); transform-origin: center;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+        }
+
+
+        * { box-sizing: border-box; transition: all 0.5s cubic-bezier(0.19, 1, 0.22, 1); }
+
+
+        #main-menu { text-align: center; width: 100%; pointer-events: none; }
+        .system-title { font-size: 8rem; color: white; font-weight: 800; margin-bottom: 20px; letter-spacing: -3px; }
+       
+        .control-status {
+            color: var(--accent-teal); font-size: 1.8rem; text-transform: uppercase;
+            letter-spacing: 10px; margin-bottom: 80px; font-weight: 600; opacity: 0.8;
+        }
+
+
+        .menu-grid { display: flex; gap: 40px; justify-content: center; }
+
+
+        .mode-card {
+            width: 460px; height: 460px; background: var(--glass-card); border: 1px solid rgba(255,255,255,0.1);
+            backdrop-filter: blur(20px); border-radius: var(--radius-xl);
+            display: flex; flex-direction: column; justify-content: center; align-items: center; cursor: default;
+        }
+
+
+        .icon-box { width: 120px; height: 120px; border-radius: 35px; display: flex; justify-content: center; align-items: center; margin-bottom: 30px; }
+        .mode-card h2 { font-size: 4rem; color: white; margin: 0; font-weight: 700; letter-spacing: -1px; }
+
+
+        #card-learn .icon-box { background: rgba(59, 130, 246, 0.15); color: var(--accent-blue); }
+        #card-game .icon-box { background: rgba(139, 92, 246, 0.15); color: var(--accent-purple); }
+        #card-scan .icon-box { background: rgba(6, 182, 212, 0.15); color: var(--accent-teal); }
+
+
+        .mode-panel {
+            position: absolute; inset: 60px; background: var(--panel-bg);
+            display: none; flex-direction: column; border-radius: 80px;
+            box-shadow: 0 100px 200px -50px rgba(0,0,0,0.7); overflow: hidden;
+        }
+
+
+        .panel-nav-bar {
+            width: 100%; height: 160px; padding: 0 80px;
+            display: flex; align-items: center; justify-content: space-between;
+            border-bottom: 1px solid var(--border-ui); background: white;
+        }
+
+
+        .nav-title { font-size: 2.2rem; font-weight: 800; color: var(--text-main); text-transform: uppercase; letter-spacing: 8px; }
+        .nav-status { display: flex; align-items: center; gap: 15px; color: #64748b; font-size: 1.8rem; font-weight: 600; }
+        .status-dot { width: 14px; height: 14px; background: #22c55e; border-radius: 50%; animation: pulse-status 2s infinite; }
+
+
+        .panel-content { flex: 1; display: flex; align-items: center; justify-content: center; flex-direction: column; }
+
+
+        .workspace-card {
+            background: white; padding: 80px; border-radius: 60px;
+            box-shadow: 0 40px 100px rgba(0,0,0,0.03); border: 1px solid var(--border-ui); display: flex; align-items: center; justify-content: center; gap: 120px;
+        }
+       
+        #game-input {
+            background: transparent; border: none; border-bottom: 8px solid var(--accent-purple);
+            color: var(--text-main); font-size: 14rem; text-align: center; width: 1200px;
+            padding: 40px; outline: none; text-transform: uppercase; font-weight: 800; margin-bottom: 40px;
+        }
+
+
+        /* --- LOG TABLE STYLES --- */
+        #history-log-container {
+            width: 1000px; background: white; border-radius: 30px; padding: 30px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.04); border: 1px solid var(--border-ui);
+            display: flex; flex-direction: column; align-items: center;
+        }
+        .log-title {
+            font-size: 2rem; color: #64748b; text-transform: uppercase; letter-spacing: 4px;
+            margin: 0 0 20px 0; font-weight: 800;
+        }
+        .log-table-wrapper {
+            width: 100%; max-height: 250px; overflow-y: auto; padding-right: 15px;
+        }
+        .log-table-wrapper::-webkit-scrollbar { width: 8px; }
+        .log-table-wrapper::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        .small-records-table { width: 100%; border-collapse: collapse; font-size: 1.6rem; }
+        .small-records-table th, .small-records-table td {
+            padding: 15px; border-bottom: 1px solid var(--border-ui); text-align: center; color: var(--text-main);
+        }
+        .small-records-table th { color: var(--accent-purple); font-weight: 800; text-transform: uppercase; letter-spacing: 1px; }
+
+
+        .speaker-box { width: 160px; height: 160px; position: relative; display: flex; justify-content: center; align-items: center; }
+        .speaker-icon { width: 110px; height: 110px; fill: var(--text-main); z-index: 2; }
+        .speaker-ring { position: absolute; width: 100px; height: 100px; border: 4px solid var(--accent-blue); border-radius: 50%; animation: ring-subtle 1.5s infinite; }
+
+
+        #timer-text { font-size: 3rem; color: var(--accent-purple); font-weight: 800; font-family: monospace; }
+
+
+        /* --- MODE 3 SCANNER STYLES --- */
+        .scanner-viewport {
+            background: #000; border-radius: 40px; position: relative; overflow: hidden; border: 10px solid white;
+            box-shadow: 0 30px 60px rgba(0,0,0,0.1); width: 100%; height: 100%; max-width: 1400px; max-height: 800px;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .scan-line {
+            position: absolute; top: 0; left: 5%; width: 90%; height: 6px;
+            background: var(--accent-teal); box-shadow: 0 0 50px 10px var(--accent-teal); animation: scan-vertical 2s ease-in-out infinite; z-index: 5;
+        }
+       
+        #scan-result-overlay {
+            position: absolute; bottom: 40px; left: 50%; transform: translateX(-50%);
+            background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(15px);
+            padding: 30px 60px; border-radius: 30px; border: 1px solid rgba(255,255,255,0.2);
+            color: white; font-size: 5rem; font-weight: 800; text-align: center;
+            display: none; z-index: 10; box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+            min-width: 400px; letter-spacing: 2px;
+        }
+        .result-label {
+            font-size: 1.6rem; color: var(--accent-teal); text-transform: uppercase; letter-spacing: 4px; display: block; margin-bottom: 10px;
+        }
+
+
+        @keyframes ring-subtle { 0% { transform: scale(1); opacity: 0.8; } 100% { transform: scale(1.6); opacity: 0; } }
+        @keyframes pulse-status { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        @keyframes scan-vertical { 0%, 100% { top: 5%; } 50% { top: 90%; } }
+    </style>
+</head>
+<body>
+
+
+    <div id="app-canvas">
+        <!-- MAIN MENU -->
+        <div id="main-menu">
+            <h1 class="system-title">Smart Braille Learning Device</h1>
+            <div class="control-status">Waiting for hardware switch input...</div>
+            <div class="menu-grid">
+                <div class="mode-card" id="card-learn">
+                    <div class="icon-box"><svg width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path></svg></div>
+                    <h2>Learn</h2>
+                </div>
+                <div class="mode-card" id="card-game">
+                    <div class="icon-box"><svg width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></div>
+                    <h2>Play</h2>
+                </div>
+                <div class="mode-card" id="card-scan">
+                    <div class="icon-box"><svg width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg></div>
+                    <h2>Scan</h2>
+                </div>
+            </div>
+        </div>
+
+
+        <!-- PANEL 1: LEARN -->
+        <div id="panel-1" class="mode-panel">
+            <div class="panel-nav-bar">
+                <div class="nav-title">Mode 01 // Learning</div>
+                <div class="nav-status"><div class="status-dot" style="background:var(--accent-blue);"></div> Playing Alphabet</div>
+            </div>
+            <div class="panel-content">
+                <div class="workspace-card" style="flex-direction: column; text-align: center; padding: 100px;">
+                    <div style="font-size: 4rem; font-weight: 800; color: var(--accent-blue);">Hardware Sync Active</div>
+                    <div style="color: #64748b; font-size: 2rem; margin-top: 20px;">Listen to the voice and feel the Braille cells.</div>
+                </div>
+            </div>
+        </div>
+
+
+        <!-- PANEL 2: GAME -->
+        <div id="panel-2" class="mode-panel">
+            <div class="panel-nav-bar">
+                <div class="nav-title">Mode 02 // Challenge</div>
+                <div id="timer-text">0.00s</div>
+            </div>
+            <div class="panel-content">
+                <div id="game-ui" style="text-align: center;">
+                    <div class="speaker-box" style="margin: 0 auto 60px;">
+                        <div class="speaker-ring" style="border-color:var(--accent-purple)"></div>
+                        <svg class="speaker-icon" viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>
+                    </div>
+                    <input type="text" id="game-input" autocomplete="off" placeholder="...">
+                </div>
+               
+                <div id="history-log-container">
+                    <h3 class="log-title">Session History</h3>
+                    <div class="log-table-wrapper">
+                        <table class="small-records-table" id="history-table">
+                            <tr><th>Session</th><th>Total Time</th><th>Speed</th></tr>
+                            <tr id="empty-row"><td colspan="3" style="color: #94a3b8; font-style: italic;">Waiting for first session to complete...</td></tr>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+
+        <!-- PANEL 3: SCAN -->
+        <div id="panel-3" class="mode-panel">
+            <div class="panel-nav-bar">
+                <div class="nav-title">Mode 03 // Optical Scan</div>
+                <div class="nav-status"><div class="status-dot" style="background:var(--accent-teal);"></div> Live Preview</div>
+            </div>
+            <div class="panel-content" style="padding: 60px;">
+                <div class="scanner-viewport">
+                    <img id="camera-stream" src="" style="width: 100%; height: 100%; object-fit: cover; display: none;">
+                    <div id="cam-placeholder" style="color: #64748b; font-size: 2.5rem; font-weight: 600;">Connecting to Camera Stream...</div>
+                    <div class="scan-line" id="scan-line" style="display: none;"></div>
+                   
+                    <div id="scan-result-overlay">
+                        <span class="result-label">Translation Result</span>
+                        <span id="scan-result-text">...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+<script>
+    const menu = document.getElementById('main-menu');
+    const panels = [document.getElementById('panel-1'), document.getElementById('panel-2'), document.getElementById('panel-3')];
+    const gameInput = document.getElementById('game-input');
+    const timerText = document.getElementById('timer-text');
+    const camStream = document.getElementById('camera-stream');
+    const camPlaceholder = document.getElementById('cam-placeholder');
+    const scanLine = document.getElementById('scan-line');
+    const scanResultOverlay = document.getElementById('scan-result-overlay');
+    const scanResultText = document.getElementById('scan-result-text');
+
+
+    let startTime = 0;
+    let timerRunning = false;
+    let timerInterval;
+    let sessionHistoryArray = [];
+
+
+    // --- mDNS CAMERA NAME (REPLACES STATIC IP) ---
+    const CAM_MDNS_URL = "braillecam.local";
+
+
+    function speak(txt, callback) {
+        window.speechSynthesis.cancel();
+        let msg = new SpeechSynthesisUtterance(txt);
+        msg.rate = 0.9;
+        if(callback) msg.onend = callback;
+        window.speechSynthesis.speak(msg);
+    }
+
+
+    function resetTimer() {
+        clearInterval(timerInterval);
+        timerRunning = false;
+        timerText.innerText = "0.00s";
+    }
+
+
+    function startTimer() {
+        startTime = Date.now();
+        timerRunning = true;
+        timerInterval = setInterval(() => {
+            let elapsed = (Date.now() - startTime) / 1000;
+            timerText.innerText = elapsed.toFixed(2) + "s";
+        }, 50);
+    }
+
+
+    function triggerCSVDownload() {
+        if(sessionHistoryArray.length === 0) {
+            speak("No records to download yet.");
+            return;
+        }
+        speak("Downloading records.");
+        let csvContent = "data:text/csv;charset=utf-8,";
+        csvContent += "Session Number,Total Time (s),Speed (WPM)\n";
+        sessionHistoryArray.forEach(function(row) {
+            csvContent += `${row.session},${row.time},${row.wpm}\n`;
+        });
+        let encodedUri = encodeURI(csvContent);
+        let link = document.createElement("a");
+        link.setAttribute("href", encodedUri);
+        link.setAttribute("download", "braille_records.csv");
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }
+
+
+    function performScan() {
+        if(document.getElementById('panel-3').style.display !== 'flex') return;
+       
+        speak("Scanning...");
+        scanLine.style.display = "block";
+        scanResultOverlay.style.display = "none";
+       
+        camStream.src = "";
+        camStream.style.display = "none";
+        camPlaceholder.innerText = "Analyzing Braille with AI...";
+        camPlaceholder.style.display = "block";
+       
+        setTimeout(() => {
+            fetch(`http://${CAM_MDNS_URL}:81/scan_now`)
+                .then(response => response.text())
+                .then(mlTranslatedText => {
+                    scanLine.style.display = "none";
+                   
+                    scanResultText.innerText = mlTranslatedText;
+                    scanResultOverlay.style.display = "block";
+                   
+                    speak("Scan complete. Translation is: " + mlTranslatedText);
+                   
+                    camPlaceholder.innerText = "Connecting to Camera Stream...";
+                    camStream.src = `http://${CAM_MDNS_URL}:81/capture`;
+                })
+                .catch(error => {
+                    console.error("API Error:", error);
+                    scanLine.style.display = "none";
+                    speak("Network error. Could not reach the camera module.");
+                   
+                    camPlaceholder.innerText = "Connecting to Camera Stream...";
+                    camStream.src = `http://${CAM_MDNS_URL}:81/capture`;
+                });
+        }, 500);
+    }
+
+
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            if (document.getElementById('panel-2').style.display === 'flex') {
+                ws.send("CHECK:" + gameInput.value.toUpperCase());
+                gameInput.value = "";
+            } else if (document.getElementById('panel-3').style.display === 'flex') {
+                performScan();
+            }
+        }
+    });
+
+
+    let ws = new WebSocket("ws://" + location.host + "/ws");
+
+
+    function setMode(id) {
+        menu.style.display = (id === 0) ? 'block' : 'none';
+        panels.forEach((p, idx) => p.style.display = (idx === id-1) ? 'flex' : 'none');
+        resetTimer();
+       
+        if(id === 0) speak("Main Menu");
+
+
+        if(id === 3) {
+            scanResultOverlay.style.display = "none";
+            camPlaceholder.innerText = "Connecting to Camera Stream...";
+           
+            camStream.src = `http://${CAM_MDNS_URL}:81/capture`;
+            camStream.onload = () => {
+                camStream.style.display = "block";
+                camPlaceholder.style.display = "none";
+            };
+        } else {
+            camStream.src = "";
+            camStream.style.display = "none";
+            camPlaceholder.style.display = "block";
+        }
+    }
+
+
+    ws.onmessage = (e) => {
+        let msg = e.data;
+        if(msg.startsWith("MODE:")) setMode(parseInt(msg.split(":")[1]));
+        if(msg === "DOWNLOAD_CSV") triggerCSVDownload();
+        if(msg === "TRIGGER_SCAN") performScan();
+
+
+        if(msg.startsWith("SAY:")) {
+            let word = msg.substring(4);
+            if (document.getElementById('panel-2').style.display === 'flex' && word !== "Challenge mode" && word.length > 1) {
+                gameInput.placeholder = "WAITING...";
+                setTimeout(() => {
+                    speak(word);
+                    gameInput.placeholder = "TYPE NOW";
+                    gameInput.focus();
+                    if(!timerRunning) startTimer();
+                }, 500);
+            } else {
+                speak(word);
+            }
+        }
+
+
+        if(msg === "CORRECT") speak("Correct");
+        if(msg.startsWith("WRONG:")) {
+            let word = msg.substring(6);
+            speak("Wrong, try again. The word is " + word);
+        }
+
+
+        if(msg.startsWith("RESULTS:")) {
+            clearInterval(timerInterval);
+            let parts = msg.split(":");
+            let timeVal = parts[1];
+            let wpmVal = parts[2];  
+           
+            let emptyRow = document.getElementById('empty-row');
+            if(emptyRow) emptyRow.remove();
+           
+            let table = document.getElementById('history-table');
+            let sessionNum = table.rows.length;
+           
+            sessionHistoryArray.push({ session: sessionNum, time: timeVal, wpm: wpmVal });
+
+
+            let newRow = table.insertRow(1);
+            newRow.innerHTML = `<td>#${sessionNum}</td><td>${timeVal}s</td><td style="color:var(--accent-purple); font-weight:800;">${wpmVal} WPM</td>`;
+           
+            speak("Session finished. Speed " + wpmVal + " words per minute.");
+           
+            gameInput.value = "";
+            gameInput.placeholder = "PRESS PLAY BUTTON TO START NEXT ROUND";
+        }
+    };
+
+
+    setMode(0);
+</script>
+</body>
+</html>
+)rawliteral";
+
+
+
+
+// =========================================================
+// --- SHUFFLE FUNCTION (NO REPEATS!) ---
+// =========================================================
+void shuffleWords() {
+  // 1. Fill the array in order (0 to 29)
+  for (int i = 0; i < 30; i++) {
+    shuffledIndices[i] = i;
+  }
+  // 2. Fisher-Yates Shuffle algorithm
+  for (int i = 29; i > 0; i--) {
+    int j = random(0, i + 1); // Pick a random index from 0 to i
+    // Swap the elements
+    int temp = shuffledIndices[i];
+    shuffledIndices[i] = shuffledIndices[j];
+    shuffledIndices[j] = temp;
+  }
+}
+
+
+// --- GAME MODE LOGIC ---
+void startNewGame() {
+  if (wordsServed >= totalRounds) {
+    float duration = (millis() - gameStartTime) / 1000.0;
+    float wpm = (totalRounds / (duration / 60.0));
+    ws.textAll("RESULTS:" + String(duration, 1) + ":" + String(wpm, 1));
+    wordsServed = 0;
+    return;
+  }
+ 
+  // Draw from the shuffled deck instead of a random roll
+  targetWordIndex = shuffledIndices[wordsServed];
+ 
+  ws.textAll("SAY:" + testWords[targetWordIndex]);
+  wordsServed++;
+}
+
+
+// =========================================================
+// --- SMOOTH SERVO CONTROL LOGIC ---
+// =========================================================
+
+
+void transitionServosTo(int targetPos[6]) {
+  bool isMoving = true;
+ 
+  while (isMoving) {
+    isMoving = false;
+   
+    for (int i = 0; i < 6; i++) {
+      if (currentPos[i] < targetPos[i]) {
+        currentPos[i] += 2;
+        isMoving = true;
+      }
+      else if (currentPos[i] > targetPos[i]) {
+        currentPos[i] -= 2;
+        isMoving = true;
+      }
+
+
+      if (abs(currentPos[i] - targetPos[i]) < 2) {
+        currentPos[i] = targetPos[i];
+      }
+
+
+      pwm.setPWM(dots[i], 0, currentPos[i]);
+    }
+   
+    delay(4);
+  }
+}
+
+
+void displayBrailleLetterSmooth(int letterIndex) {
+  int targetPos[6];
+  for (int i = 0; i < 6; i++) {
+    targetPos[i] = braille[letterIndex][i] ? UP_POS : DOWN_POS;
+  }
+  transitionServosTo(targetPos);
+}
+
+
+void clearBrailleSmooth() {
+  int targetPos[6] = {DOWN_POS, DOWN_POS, DOWN_POS, DOWN_POS, DOWN_POS, DOWN_POS};
+  transitionServosTo(targetPos);
+}
+
+
+// =========================================================
+
+
+// --- MODE CONTROLLER ---
+void activateMode(int m) {
+  if (activeMode == 1 && m != 1) {
+    clearBrailleSmooth();
+  }
+
+
+  // --- SCANNER LED LOGIC ---
+  if (m == 3) {
+    digitalWrite(scanLed1, HIGH);
+    digitalWrite(scanLed2, HIGH);
+  } else {
+    digitalWrite(scanLed1, LOW);
+    digitalWrite(scanLed2, LOW);
+  }
+
+
+  activeMode = m;
+  ws.textAll("MODE:" + String(m));
+
+
+  if (m == 1) {
+    alphabetIndex = 0;
+    learnStateStep = -1;
+    ws.textAll("SAY:Learning mode");
+    lastLetterTime = millis();
+    Serial.println("\n--- MODE 1: STARTING ---");
+  }
+  else if (m == 2) {
+    ws.textAll("SAY:Challenge mode");
+    wordsServed = 0;
+   
+    // SHUFFLE THE DECK EVERY TIME GAME MODE STARTS
+    shuffleWords();
+   
+    gameStarting = true;
+    gameInitTime = millis();
+  }
+  else if (m == 3) {
+    ws.textAll("SAY:Scan mode");
+  }
+}
+
+
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_DATA) {
+    AwsFrameInfo *info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+      data[len] = 0; String message = (char*)data;
+      if(message.startsWith("CHECK:")) {
+        String attempt = message.substring(6);
+        if(targetWordIndex != -1 && attempt == testWords[targetWordIndex]) {
+          ws.textAll("CORRECT");
+          delay(1000);
+          startNewGame();
+        } else {
+          ws.textAll("WRONG:" + testWords[targetWordIndex]);
+        }
+      }
+    }
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  randomSeed(analogRead(0));
+ 
+  pinMode(buttonLearnPin, INPUT_PULLUP);
+  pinMode(buttonGamePin, INPUT_PULLUP);
+  pinMode(buttonScanPin, INPUT_PULLUP);
+  pinMode(buttonDownloadPin, INPUT_PULLUP);
+
+
+  // --- INITIALIZE LEDS ---
+  pinMode(scanLed1, OUTPUT);
+  pinMode(scanLed2, OUTPUT);
+  digitalWrite(scanLed1, LOW);
+  digitalWrite(scanLed2, LOW);
+
+
+  // --- INITIALIZE PCA9685 SERVO DRIVER ---
+  pwm.begin();
+  pwm.setPWMFreq(50);
+  clearBrailleSmooth();
+
+
+  // --- CONNECT TO WIFI ---
+  WiFi.begin("Nozaki-kun 2.4G", "Phoebe  Hunter  Kim");
+  Serial.print("Connecting to Nozaki-kun 2.4G");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected!");
+
+
+  // --- START mDNS RESPONDER ---
+  if (!MDNS.begin("brailleui")) {
+    Serial.println("Error setting up MDNS responder!");
+  } else {
+    Serial.println("mDNS responder started.");
+    Serial.println("Web UI is now ALWAYS available at: http://brailleui.local");
+  }
+
+
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+  server.begin();
+}
+
+
+void loop() {
+  ws.cleanupClients();
+
+
+  bool readingLearn = digitalRead(buttonLearnPin);
+  bool readingGame = digitalRead(buttonGamePin);
+  bool readingScan = digitalRead(buttonScanPin);
+  bool readingDownload = digitalRead(buttonDownloadPin);
+
+
+  if (readingLearn == LOW && lastLearnState == HIGH) {
+    activateMode(1);
+    delay(250);
+  }
+  if (readingGame == LOW && lastGameState == HIGH) {
+    activateMode(2);
+    delay(250);
+  }
+ 
+  if (readingScan == LOW && lastScanState == HIGH) {
+    if (activeMode != 3) {
+        activateMode(3);
+    } else {
+        ws.textAll("TRIGGER_SCAN");
+    }
+    delay(250);
+  }
+ 
+  if (readingDownload == LOW && lastDownloadState == HIGH) {
+    ws.textAll("DOWNLOAD_CSV");
+    delay(250);
+  }
+
+
+  lastLearnState = readingLearn;
+  lastGameState = readingGame;
+  lastScanState = readingScan;
+  lastDownloadState = readingDownload;
+
+
+  if (activeMode == 1) {
+    if (alphabetIndex <= 25) {
+      char currentLetter = 'A' + alphabetIndex;
+     
+      if (learnStateStep == -1) {
+        if (millis() - lastLetterTime >= 3000) {
+          learnStateStep = 0;
+        }
+      }
+      else if (learnStateStep == 0) {
+        ws.textAll("SAY:" + String(currentLetter));
+        Serial.println("Letter: " + String(currentLetter));
+       
+        displayBrailleLetterSmooth(alphabetIndex);
+       
+        lastLetterTime = millis();
+        learnStateStep = 1;
+      }
+      else if (learnStateStep == 1) {
+        if (millis() - lastLetterTime >= 3000) {
+          ws.textAll("SAY:" + String(currentLetter));
+         
+          lastLetterTime = millis();
+          learnStateStep = 2;
+        }
+      }
+      else if (learnStateStep == 2) {
+        if (millis() - lastLetterTime >= 3000) {
+          alphabetIndex++;
+          learnStateStep = 0;
+        }
+      }
+    }
+    else {
+      // --- NEW SMART DELAY FOR THE ENDING ---
+      if (learnStateStep == 0) {
+        ws.textAll("SAY:Alphabet complete");
+        Serial.println("--- ALPHABET COMPLETE ---");
+        clearBrailleSmooth();
+       
+        lastLetterTime = millis();
+        learnStateStep = 1;        
+      }
+      else if (learnStateStep == 1) {
+        if (millis() - lastLetterTime >= 3000) {
+          activateMode(0);
+        }
+      }
+    }
+  }
+
+
+  if (activeMode == 2 && gameStarting) {
+    if (millis() - gameInitTime >= 3000) {
+      gameStarting = false;
+      gameStartTime = millis();
+      startNewGame();
+    }
+  }
+
+
+  delay(10);
+}
+
