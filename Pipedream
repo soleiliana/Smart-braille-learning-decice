@@ -1,0 +1,40 @@
+import base64
+import requests
+import json
+
+def handler(pd):
+    # 1. Access the event data
+    event = pd.steps["trigger"]["event"]
+    body = event.get("body", {})
+    
+    # Force parse into dictionary if it arrives as a string
+    if isinstance(body, str):
+        body = json.loads(body)
+        
+    if "bodyRaw64" in body:
+        base64_string = body["bodyRaw64"]
+    else:
+        raise Exception("Could not find 'bodyRaw64'.")
+    
+    # 2. Decode the image
+    binary_data = base64.b64decode(base64_string)
+    files = {
+        'file': ('image.jpg', binary_data, 'image/jpeg')
+    }
+
+    # 3. Standard Roboflow API using your NEW Model ID: braillify/1
+    url = "https://detect.roboflow.com/braillify/1?api_key=dZn2689ogAmvoNAFOSvj&confidence=40&overlap=30"
+    
+    roboflow_response = requests.post(url, files=files)
+    api_json = roboflow_response.json()
+    
+    # 4. SEND DATA BACK TO THE CAMERA
+    pd.respond({
+        "status": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": api_json
+    })
+    
+    return api_json
+
+
